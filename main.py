@@ -4,6 +4,7 @@ import time
 
 import requests
 from playwright.async_api import async_playwright
+from playwright_stealth import stealth_async
 
 WEBHOOK_URL = os.environ["WEBHOOK_URL"]
 ROLE_ID = os.environ["ROLE_ID"]
@@ -36,108 +37,71 @@ def format_job(job: dict) -> str:
 
 async def scrape_jobs() -> dict[str, dict]:
     jobs = {}
-    api_data: list[dict] = []
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 800},
         )
         page = await context.new_page()
-
-        # Intercept all JSON responses and detect job listing payloads
-        async def handle_response(response):
-            ct = response.headers.get("content-type", "")
-            if "json" not in ct:
-                return
-            try:
-                data = await response.json()
-                candidates: list = []
-                if isinstance(data, list):
-                    candidates = data
-                elif isinstance(data, dict):
-                    for key in ["value", "items", "jobs", "jobRequisitions", "data", "results", "listings", "requisitions"]:
-                        v = data.get(key)
-                        if isinstance(v, list) and v:
-                            candidates = v
-                            break
-                if candidates and isinstance(candidates[0], dict):
-                    job_keys = {"jobTitle", "title", "positionTitle", "jobRequisitionID", "requisitionId", "id", "name"}
-                    if job_keys & set(candidates[0].keys()):
-                        api_data.extend(candidates)
-            except Exception:
-                pass
-
-        page.on("response", handle_response)
+        await stealth_async(page)
 
         await page.goto(JOB_URL, wait_until="networkidle", timeout=60000)
 
-        # cx-job-listing-item is an Angular custom element tag (not a CSS class)
         try:
-            await page.wait_for_selector(
-                "cx-job-listing-item, [class*='job-listing'], [class*='job-card']",
-                timeout=20000,
-            )
+            await page.wait_for_selector("cx-result-field", timeout=25000)
         except Exception:
             pass
 
-        if api_data:
-            for item in api_data:
-                title = (
-                    item.get("jobTitle")
-                    or item.get("title")
-                    or item.get("positionTitle")
-                    or item.get("name")
-                    or ""
-                )
-                location = (
-                    item.get("primaryLocation")
-                    or item.get("location")
-                    or item.get("locationName")
-                    or ""
-                )
-                if isinstance(location, dict):
-                    location = location.get("nameCode", {}).get("longName", "") or location.get("city", "")
-                job_type = item.get("workSchedule") or item.get("jobType") or item.get("employmentType") or ""
-                if isinstance(job_type, dict):
-                    job_type = job_type.get("longName", "") or job_type.get("codeValue", "")
-                job_id = str(item.get("jobRequisitionID") or item.get("id") or item.get("requisitionId") or title)
-                job_url = item.get("applyUrl") or item.get("url") or ""
-
-                loc_str = str(location).upper()
-                if "NASHVILLE" in loc_str or "BNA" in loc_str or "TN" in loc_str:
-                    jobs[job_id] = {
-                        "title": title,
-                        "location": str(location),
-                        "type": str(job_type),
-                        "url": job_url,
+        while True:
+            cards = await page.evaluate("""() => {
+                const cards = document.querySelectorAll('cx-result-field');
+                return Array.from(cards).map(card => {
+                    const walker = document.createTreeWalker(card, NodeFilter.SHOW_TEXT);
+                    const texts = [];
+                    while (walker.nextNode()) {
+                        const t = walker.currentNode.textContent.trim();
+                        if (t) texts.push(t);
                     }
-        else:
-            # DOM fallback — use tag selector (Angular custom element, not CSS class)
-            cards = await page.query_selector_all("cx-job-listing-item")
-            if not cards:
-                cards = await page.query_selector_all("[class*='job-card'], [class*='job-item'], [class*='position-card']")
+                    const h3 = card.querySelector('h3');
+                    const a = card.querySelector('a');
+                    return {
+                        title: h3 ? h3.textContent.trim() : (texts[0] || ''),
+                        href: a ? a.href : '',
+                        texts: texts
+                    };
+                });
+            }""")
+
             for card in cards:
-                a = await card.query_selector("a")
-                title = (await a.inner_text()).strip() if a else ""
+                title = card.get("title", "")
+                texts = card.get("texts", [])
+                href = card.get("href", "") or JOB_URL
                 if not title:
                     continue
-                href = (await a.get_attribute("href") or "") if a else ""
-                text = (await card.inner_text()).strip()
-                lines = [l.strip() for l in text.splitlines() if l.strip()]
-                location = next((l for l in lines if "Nashville" in l or "Tennessee" in l or "BNA" in l), "")
+                location = next((t for t in texts if "Nashville" in t or "Tennessee" in t or "BNA" in t), "")
                 if not location:
                     continue
                 job_type = "Part-Time" if "part-time" in title.lower() else "Full-Time" if "full-time" in title.lower() else ""
-                if href and not href.startswith("http"):
-                    href = "https://myjobs.adp.com" + href
-                job_id = title + "|" + location
-                jobs[job_id] = {
-                    "title": title,
-                    "location": location,
-                    "type": job_type,
-                    "url": href,
-                }
+                req_id = next((t for t in texts if t.startswith("26-")), title)
+                jobs[req_id] = {"title": title, "location": location, "type": job_type, "url": href}
+
+            has_next = await page.evaluate("""() => {
+                const btn = Array.from(document.querySelectorAll('button'))
+                    .find(b => b.textContent.trim() === 'Next' && !b.disabled);
+                if (btn) { btn.click(); return true; }
+                return false;
+            }""")
+
+            if not has_next:
+                break
+
+            await page.wait_for_timeout(2000)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=10000)
+            except Exception:
+                pass
 
         await browser.close()
 
@@ -172,7 +136,6 @@ def check_jobs(current: dict[str, dict]):
 
     if new_jobs or removed_jobs or is_first_run:
         message = f"<@&{ROLE_ID}>\n\n" + "\n\n".join(parts)
-        # Discord max 2000 chars — chunk if needed
         if len(message) > 1900:
             chunks = []
             current_chunk = f"<@&{ROLE_ID}>\n\n"
