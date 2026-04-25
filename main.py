@@ -40,9 +40,15 @@ seen_jobs: dict[str, dict[str, str]] | None = None
 last_failure_alert_at = 0.0
 
 
-def send(content: str) -> None:
-    response = requests.post(WEBHOOK_URL, json={"content": content}, timeout=10)
-    response.raise_for_status()
+def send(content: str) -> bool:
+    try:
+        response = requests.post(WEBHOOK_URL, json={"content": content}, timeout=10)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        print(f"Discord send failed: {exc}")
+        return False
+
+    return True
 
 
 def fetch_html(url: str) -> str:
@@ -229,23 +235,25 @@ def format_job(job: dict[str, str]) -> str:
     return " | ".join(parts)
 
 
-def send_chunks(parts: list[str]) -> None:
+def send_chunks(parts: list[str]) -> bool:
     message = f"<@&{ROLE_ID}>\n\n" + "\n\n".join(parts)
     if len(message) <= 1900:
-        send(message)
-        return
+        return send(message)
 
+    all_sent = True
     current_chunk = f"<@&{ROLE_ID}>\n\n"
     for part in parts:
         if len(current_chunk) + len(part) + 2 > 1900:
-            send(current_chunk.strip())
+            all_sent = send(current_chunk.strip()) and all_sent
             time.sleep(1)
             current_chunk = f"<@&{ROLE_ID}>\n\n{part}\n\n"
         else:
             current_chunk += part + "\n\n"
 
     if current_chunk.strip():
-        send(current_chunk.strip())
+        all_sent = send(current_chunk.strip()) and all_sent
+
+    return all_sent
 
 
 def maybe_send_failure_alert(message: str) -> None:
@@ -288,7 +296,9 @@ def check_jobs(current: dict[str, dict[str, str]]) -> None:
         parts.append(f"REMOVED ({len(removed_jobs)}):\n{lines}")
 
     if is_first_run or new_jobs or removed_jobs:
-        send_chunks(parts)
+        if not send_chunks(parts):
+            print("Notification failed; preserving previous state for retry.")
+            return
 
     seen_jobs = current
 
