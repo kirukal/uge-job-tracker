@@ -2,9 +2,11 @@ import html
 import json
 import os
 import re
+import signal
 import time
-from datetime import date
-from typing import Any
+from datetime import UTC, date, datetime
+from pathlib import Path
+from typing import Any, Iterable
 from urllib.parse import quote, urljoin
 
 import requests
@@ -14,6 +16,13 @@ WEBHOOK_URL = os.environ["WEBHOOK_URL"]
 ROLE_ID = os.environ["ROLE_ID"]
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))
 FAILURE_ALERT_INTERVAL = int(os.getenv("FAILURE_ALERT_INTERVAL", "3600"))
+STATE_FILE = Path(os.getenv("STATE_FILE", "/tmp/uge-job-tracker-state.json"))
+REMOVAL_CONFIRMATIONS = int(os.getenv("REMOVAL_CONFIRMATIONS", "2"))
+CLOSING_SOON_DAYS = int(os.getenv("CLOSING_SOON_DAYS", "3"))
+FETCH_RETRIES = int(os.getenv("FETCH_RETRIES", "3"))
+ANNOUNCE_FIRST_RUN = os.getenv("ANNOUNCE_FIRST_RUN", "").lower() in {"1", "true", "yes"}
+RUN_ONCE = os.getenv("RUN_ONCE", "").lower() in {"1", "true", "yes"}
+DRY_RUN = os.getenv("DRY_RUN", "").lower() in {"1", "true", "yes"}
 
 BEEBEE_BASE_URL = "https://bebee.com"
 BEEBEE_SEARCH_QUERIES = [
@@ -36,11 +45,29 @@ HTTP_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-seen_jobs: dict[str, dict[str, str]] | None = None
+state: dict[str, Any] = {}
 last_failure_alert_at = 0.0
+should_stop = False
+
+
+def empty_state() -> dict[str, Any]:
+    return {
+        "known_jobs": {},
+        "missing_counts": {},
+        "closing_alerted": [],
+        "last_success_at": "",
+    }
+
+
+def log(message: str) -> None:
+    print(f"[{datetime.now(UTC).isoformat(timespec='seconds')}] {message}", flush=True)
 
 
 def send(content: str) -> bool:
+    if DRY_RUN:
+        log(f"DRY_RUN Discord message suppressed: {content[:500]}")
+        return True
+
     try:
         response = requests.post(
             WEBHOOK_URL,
@@ -52,20 +79,41 @@ def send(content: str) -> bool:
         )
         response.raise_for_status()
     except requests.RequestException as exc:
-        print(f"Discord send failed: {exc}")
+        log(f"Discord send failed: {exc}")
         return False
 
     return True
 
 
 def fetch_html(url: str) -> str:
-    response = requests.get(url, headers=HTTP_HEADERS, timeout=25)
-    response.raise_for_status()
-    return response.text
+    last_error: requests.RequestException | None = None
+
+    for attempt in range(1, FETCH_RETRIES + 1):
+        try:
+            response = requests.get(url, headers=HTTP_HEADERS, timeout=25)
+            response.raise_for_status()
+            return response.text
+        except requests.RequestException as exc:
+            last_error = exc
+            if attempt < FETCH_RETRIES:
+                time.sleep(min(2**attempt, 10))
+
+    raise last_error or requests.RequestException(f"Failed to fetch {url}")
 
 
 def compact_text(value: str) -> str:
     return " ".join(html.unescape(value or "").split())
+
+
+def parse_date(value: str) -> date | None:
+    value = compact_text(value)
+    if not value:
+        return None
+
+    try:
+        return date.fromisoformat(value[:10])
+    except ValueError:
+        return None
 
 
 def get_org_name(job_posting: dict[str, Any]) -> str:
@@ -127,14 +175,11 @@ def get_job_key(job_posting: dict[str, Any], fallback_url: str) -> str:
 
 
 def is_active(job_posting: dict[str, Any]) -> bool:
-    valid_through = compact_text(str(job_posting.get("validThrough") or ""))
-    if not valid_through:
+    valid_through = parse_date(str(job_posting.get("validThrough") or ""))
+    if valid_through is None:
         return True
 
-    try:
-        return date.fromisoformat(valid_through[:10]) >= date.today()
-    except ValueError:
-        return True
+    return valid_through >= date.today()
 
 
 def is_bna_uge_job(job_posting: dict[str, Any], url: str) -> bool:
@@ -151,6 +196,24 @@ def is_bna_uge_job(job_posting: dict[str, Any], url: str) -> bool:
     )
 
 
+def iter_jsonld_items(payload: Any) -> Iterable[dict[str, Any]]:
+    if isinstance(payload, dict):
+        item_type = payload.get("@type")
+        if item_type == "JobPosting" or (
+            isinstance(item_type, list) and "JobPosting" in item_type
+        ):
+            yield payload
+
+        for key, value in payload.items():
+            if key in {"@context"}:
+                continue
+            if isinstance(value, (dict, list)):
+                yield from iter_jsonld_items(value)
+    elif isinstance(payload, list):
+        for item in payload:
+            yield from iter_jsonld_items(item)
+
+
 def extract_job_posting(page_html: str) -> dict[str, Any] | None:
     soup = BeautifulSoup(page_html, "html.parser")
 
@@ -160,10 +223,8 @@ def extract_job_posting(page_html: str) -> dict[str, Any] | None:
         except json.JSONDecodeError:
             continue
 
-        items = payload if isinstance(payload, list) else [payload]
-        for item in items:
-            if isinstance(item, dict) and item.get("@type") == "JobPosting":
-                return item
+        for item in iter_jsonld_items(payload):
+            return item
 
     return None
 
@@ -202,7 +263,7 @@ def scrape_jobs() -> dict[str, dict[str, str]]:
             page_html = fetch_html(url)
             job_posting = extract_job_posting(page_html)
         except requests.RequestException as exc:
-            print(f"Failed to fetch {url}: {exc}")
+            log(f"Failed to fetch {url}: {exc}")
             continue
 
         if not job_posting or not is_bna_uge_job(job_posting, url):
@@ -228,6 +289,7 @@ def format_job(job: dict[str, str]) -> str:
     job_type = job.get("type", "")
     url = job.get("url", "")
     posted = job.get("posted", "")
+    valid_through = job.get("valid_through", "")
     tag = " - Alaska" if "alaska" in title.lower() else ""
 
     parts = [f"**{title}**{tag}"]
@@ -236,7 +298,9 @@ def format_job(job: dict[str, str]) -> str:
     if job_type:
         parts.append(f"Type: {job_type}")
     if posted:
-        parts.append(f"Posted: {posted}")
+        parts.append(f"Posted: {posted[:10]}")
+    if valid_through:
+        parts.append(f"Closes: {valid_through[:10]}")
     if url:
         parts.append(f"Apply: {url}")
     return " | ".join(parts)
@@ -263,6 +327,35 @@ def send_chunks(parts: list[str]) -> bool:
     return all_sent
 
 
+def load_state() -> dict[str, Any]:
+    if not STATE_FILE.exists():
+        return empty_state()
+
+    try:
+        loaded = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        log(f"State file unreadable; starting fresh: {exc}")
+        return empty_state()
+
+    merged = empty_state()
+    if isinstance(loaded, dict):
+        merged.update(loaded)
+    if not isinstance(merged.get("known_jobs"), dict):
+        merged["known_jobs"] = {}
+    if not isinstance(merged.get("missing_counts"), dict):
+        merged["missing_counts"] = {}
+    if not isinstance(merged.get("closing_alerted"), list):
+        merged["closing_alerted"] = []
+    return merged
+
+
+def save_state() -> None:
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp_file = STATE_FILE.with_suffix(f"{STATE_FILE.suffix}.tmp")
+    tmp_file.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+    tmp_file.replace(STATE_FILE)
+
+
 def maybe_send_failure_alert(message: str) -> None:
     global last_failure_alert_at
 
@@ -274,54 +367,126 @@ def maybe_send_failure_alert(message: str) -> None:
     last_failure_alert_at = now
 
 
-def check_jobs(current: dict[str, dict[str, str]]) -> None:
-    global seen_jobs
+def get_closing_soon_jobs(current: dict[str, dict[str, str]]) -> dict[str, dict[str, str]]:
+    if CLOSING_SOON_DAYS <= 0:
+        return {}
 
+    already_alerted = set(state.get("closing_alerted", []))
+    today = date.today()
+    soon: dict[str, dict[str, str]] = {}
+
+    for key, job in current.items():
+        valid_through = parse_date(job.get("valid_through", ""))
+        if valid_through is None or key in already_alerted:
+            continue
+
+        days_left = (valid_through - today).days
+        if 0 <= days_left <= CLOSING_SOON_DAYS:
+            soon[key] = job
+
+    return soon
+
+
+def check_jobs(current: dict[str, dict[str, str]]) -> None:
     if not current:
-        print("No jobs found; keeping previous state unchanged.")
+        log("No jobs found; keeping previous state unchanged.")
         maybe_send_failure_alert(
             "No BNA jobs found from BeBee mirror. Keeping previous state to avoid false removals/spam."
         )
         return
 
-    is_first_run = seen_jobs is None
-    previous = seen_jobs or {}
-    new_jobs = {key: value for key, value in current.items() if key not in previous}
-    removed_jobs = {key: value for key, value in previous.items() if key not in current}
+    previous: dict[str, dict[str, str]] = state.get("known_jobs", {})
+    missing_counts: dict[str, int] = {
+        key: int(value) for key, value in state.get("missing_counts", {}).items()
+    }
+    is_first_run = not previous
+    new_jobs = (
+        {}
+        if is_first_run
+        else {key: value for key, value in current.items() if key not in previous}
+    )
+
+    confirmed_removed: dict[str, dict[str, str]] = {}
+    for key, job in previous.items():
+        if key in current:
+            missing_counts.pop(key, None)
+            continue
+
+        missing_counts[key] = missing_counts.get(key, 0) + 1
+        if missing_counts[key] >= REMOVAL_CONFIRMATIONS:
+            confirmed_removed[key] = job
+
+    for key in confirmed_removed:
+        previous.pop(key, None)
+        missing_counts.pop(key, None)
 
     parts: list[str] = []
 
-    lines = "\n".join(format_job(job) for job in current.values())
-    parts.append(f"CURRENT BNA JOBS ({len(current)}):\n{lines}")
+    if is_first_run and ANNOUNCE_FIRST_RUN:
+        lines = "\n".join(format_job(job) for job in current.values())
+        parts.append(f"TRACKER ONLINE - CURRENT BNA JOBS ({len(current)}):\n{lines}")
 
     if new_jobs:
         lines = "\n".join(format_job(job) for job in new_jobs.values())
         parts.append(f"NEW ({len(new_jobs)}):\n{lines}")
 
-    if removed_jobs:
-        lines = "\n".join(format_job(job) for job in removed_jobs.values())
-        parts.append(f"REMOVED ({len(removed_jobs)}):\n{lines}")
+    if confirmed_removed:
+        lines = "\n".join(format_job(job) for job in confirmed_removed.values())
+        parts.append(f"REMOVED ({len(confirmed_removed)}):\n{lines}")
 
-    if is_first_run or new_jobs or removed_jobs:
-        if not send_chunks(parts):
-            print("Notification failed; preserving previous state for retry.")
-            return
+    closing_soon = get_closing_soon_jobs(current)
+    if closing_soon:
+        lines = "\n".join(format_job(job) for job in closing_soon.values())
+        parts.append(f"CLOSING SOON ({len(closing_soon)}):\n{lines}")
 
-    seen_jobs = current
+    if parts and not send_chunks(parts):
+        log("Notification failed; preserving previous state for retry.")
+        return
+
+    if not parts:
+        log("No Discord-worthy job changes.")
+
+    for key in closing_soon:
+        if key not in state["closing_alerted"]:
+            state["closing_alerted"].append(key)
+
+    state["known_jobs"] = {**previous, **current}
+    state["missing_counts"] = missing_counts
+    state["last_success_at"] = datetime.now(UTC).isoformat(timespec="seconds")
+    save_state()
+
+
+def handle_shutdown(signum: int, _frame: Any) -> None:
+    global should_stop
+
+    should_stop = True
+    log(f"Received signal {signum}; shutting down after current check.")
 
 
 def main() -> None:
-    print("UGE Job Tracker starting...")
+    global state
 
-    while True:
+    signal.signal(signal.SIGTERM, handle_shutdown)
+    signal.signal(signal.SIGINT, handle_shutdown)
+    state = load_state()
+    log(
+        "UGE Job Tracker starting "
+        f"(interval={CHECK_INTERVAL}s, removal_confirmations={REMOVAL_CONFIRMATIONS}, "
+        f"closing_soon_days={CLOSING_SOON_DAYS}, state_file={STATE_FILE})"
+    )
+
+    while not should_stop:
         try:
-            print("Checking jobs...")
+            log("Checking jobs...")
             current = scrape_jobs()
-            print(f"Found {len(current)} BNA jobs")
+            log(f"Found {len(current)} BNA jobs")
             check_jobs(current)
         except Exception as exc:
-            print(f"Error: {exc}")
+            log(f"Error: {exc}")
             maybe_send_failure_alert(f"Tracker error: {exc}")
+
+        if RUN_ONCE:
+            break
 
         time.sleep(CHECK_INTERVAL)
 
