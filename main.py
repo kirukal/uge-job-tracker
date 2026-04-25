@@ -1,177 +1,313 @@
-import asyncio
+import html
+import json
 import os
+import re
 import time
+from datetime import date
+from typing import Any
+from urllib.parse import quote, urljoin
 
 import requests
-from playwright.async_api import async_playwright
-from playwright_stealth import stealth_async
+from bs4 import BeautifulSoup
 
 WEBHOOK_URL = os.environ["WEBHOOK_URL"]
 ROLE_ID = os.environ["ROLE_ID"]
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "90"))
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))
+FAILURE_ALERT_INTERVAL = int(os.getenv("FAILURE_ALERT_INTERVAL", "3600"))
 
-JOB_URL = "https://myjobs.adp.com/unitedgroundexpressexternal/cx/job-listing"
+BEEBEE_BASE_URL = "https://bebee.com"
+BEEBEE_SEARCH_QUERIES = [
+    "BNA United Ground Express",
+    "United Ground Express Customer Service Agent BNA",
+    "United Ground Express Airport Ramp Agent BNA",
+    "United Ground Express Airport Supervisor BNA",
+    "United Ground Express GSE Mechanic BNA",
+    "United Ground Express Aircraft Fueling BNA",
+    "United Ground Express Quality Control BNA",
+]
 
-seen_jobs: dict[str, dict] = {}
+HTTP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+seen_jobs: dict[str, dict[str, str]] | None = None
+last_failure_alert_at = 0.0
 
 
-def send(content: str):
-    requests.post(WEBHOOK_URL, json={"content": content}, timeout=10)
+def send(content: str) -> None:
+    response = requests.post(WEBHOOK_URL, json={"content": content}, timeout=10)
+    response.raise_for_status()
 
 
-def format_job(job: dict) -> str:
-    title = job.get("title", "Unknown")
-    location = job.get("location", "")
-    job_type = job.get("type", "")
-    url = job.get("url", "")
-    tag = " — Alaska" if "alaska" in title.lower() else ""
-    parts = [f"**{title}**{tag}"]
-    if location:
-        parts.append(f"📍 {location}")
-    if job_type:
-        parts.append(f"⏱ {job_type}")
-    if url:
-        parts.append(f"🔗 {url}")
-    return " | ".join(parts)
+def fetch_html(url: str) -> str:
+    response = requests.get(url, headers=HTTP_HEADERS, timeout=25)
+    response.raise_for_status()
+    return response.text
 
 
-async def scrape_jobs() -> dict[str, dict]:
-    jobs = {}
+def compact_text(value: str) -> str:
+    return " ".join(html.unescape(value or "").split())
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 800},
-        )
-        page = await context.new_page()
-        await stealth_async(page)
 
-        await page.goto(JOB_URL, wait_until="networkidle", timeout=60000)
+def get_org_name(job_posting: dict[str, Any]) -> str:
+    organization = job_posting.get("hiringOrganization")
+    if isinstance(organization, dict):
+        return compact_text(str(organization.get("name") or ""))
+    return compact_text(str(organization or ""))
 
+
+def get_location(job_posting: dict[str, Any]) -> str:
+    location = job_posting.get("jobLocation")
+    if isinstance(location, list):
+        location = location[0] if location else {}
+
+    if isinstance(location, dict):
+        address = location.get("address")
+        if isinstance(address, dict):
+            locality = compact_text(str(address.get("addressLocality") or ""))
+            region = compact_text(str(address.get("addressRegion") or ""))
+            country = compact_text(str(address.get("addressCountry") or ""))
+            if locality and ("," in locality or region.lower() in {"davidson"}):
+                return locality
+            parts = [part for part in [locality, region, country] if part]
+            return ", ".join(parts)
+        return compact_text(str(location.get("name") or ""))
+
+    return compact_text(str(location or ""))
+
+
+def normalize_job_type(value: Any) -> str:
+    if isinstance(value, list):
+        value = ", ".join(str(item) for item in value)
+
+    raw = compact_text(str(value or "")).replace("_", " ").title()
+    return raw if raw and raw != "None" else ""
+
+
+def infer_job_type(title: str, value: Any) -> str:
+    lower_title = title.lower()
+    if "part-time" in lower_title or "part time" in lower_title:
+        return "Part-Time"
+    if "full-time" in lower_title or "full time" in lower_title:
+        return "Full-Time"
+
+    normalized = normalize_job_type(value)
+    return "" if normalized == "Contractor" else normalized
+
+
+def get_job_key(job_posting: dict[str, Any], fallback_url: str) -> str:
+    identifier = job_posting.get("identifier")
+    if isinstance(identifier, dict) and identifier.get("value"):
+        return compact_text(str(identifier["value"]))
+
+    match = re.search(r"--([a-z]+-\d+)", fallback_url)
+    if match:
+        return match.group(1)
+
+    return fallback_url.rstrip("/")
+
+
+def is_active(job_posting: dict[str, Any]) -> bool:
+    valid_through = compact_text(str(job_posting.get("validThrough") or ""))
+    if not valid_through:
+        return True
+
+    try:
+        return date.fromisoformat(valid_through[:10]) >= date.today()
+    except ValueError:
+        return True
+
+
+def is_bna_uge_job(job_posting: dict[str, Any], url: str) -> bool:
+    title = compact_text(str(job_posting.get("title") or ""))
+    organization = get_org_name(job_posting)
+    location = get_location(job_posting)
+    description = compact_text(str(job_posting.get("description") or ""))
+
+    haystack = " ".join([title, organization, location, description, url]).lower()
+    return (
+        "united ground express" in organization.lower()
+        and ("bna" in haystack or "nashville" in haystack)
+        and is_active(job_posting)
+    )
+
+
+def extract_job_posting(page_html: str) -> dict[str, Any] | None:
+    soup = BeautifulSoup(page_html, "html.parser")
+
+    for script in soup.find_all("script", type="application/ld+json"):
         try:
-            await page.wait_for_selector("cx-result-field", timeout=25000)
-        except Exception:
-            pass
+            payload = json.loads(script.string or script.get_text())
+        except json.JSONDecodeError:
+            continue
 
-        while True:
-            cards = await page.evaluate("""() => {
-                const cards = document.querySelectorAll('cx-result-field');
-                return Array.from(cards).map(card => {
-                    const walker = document.createTreeWalker(card, NodeFilter.SHOW_TEXT);
-                    const texts = [];
-                    while (walker.nextNode()) {
-                        const t = walker.currentNode.textContent.trim();
-                        if (t) texts.push(t);
-                    }
-                    const h3 = card.querySelector('h3');
-                    const a = card.querySelector('a');
-                    return {
-                        title: h3 ? h3.textContent.trim() : (texts[0] || ''),
-                        href: a ? a.href : '',
-                        texts: texts
-                    };
-                });
-            }""")
+        items = payload if isinstance(payload, list) else [payload]
+        for item in items:
+            if isinstance(item, dict) and item.get("@type") == "JobPosting":
+                return item
 
-            for card in cards:
-                title = card.get("title", "")
-                texts = card.get("texts", [])
-                href = card.get("href", "") or JOB_URL
-                if not title:
-                    continue
-                location = next((t for t in texts if "Nashville" in t or "Tennessee" in t or "BNA" in t), "")
-                if not location:
-                    continue
-                job_type = "Part-Time" if "part-time" in title.lower() else "Full-Time" if "full-time" in title.lower() else ""
-                req_id = next((t for t in texts if t.startswith("26-")), title)
-                jobs[req_id] = {"title": title, "location": location, "type": job_type, "url": href}
+    return None
 
-            has_next = await page.evaluate("""() => {
-                const btn = Array.from(document.querySelectorAll('button'))
-                    .find(b => b.textContent.trim() === 'Next' && !b.disabled);
-                if (btn) { btn.click(); return true; }
-                return false;
-            }""")
 
-            if not has_next:
-                break
+def discover_bebee_job_urls() -> list[str]:
+    urls: dict[str, None] = {}
 
-            await page.wait_for_timeout(2000)
-            try:
-                await page.wait_for_load_state("networkidle", timeout=10000)
-            except Exception:
-                pass
+    for query in BEEBEE_SEARCH_QUERIES:
+        search_url = (
+            f"{BEEBEE_BASE_URL}/us/jobs"
+            f"?q={quote(query)}&location=Nashville%2C+TN"
+        )
+        page_html = fetch_html(search_url)
+        soup = BeautifulSoup(page_html, "html.parser")
 
-        await browser.close()
+        for link in soup.find_all("a", href=True):
+            href = str(link["href"])
+            text = compact_text(link.get_text(" ", strip=True))
+            candidate = f"{text} {href}".lower()
+
+            if (
+                "/us/jobs/" in href
+                and "united-ground-express" in href
+                and ("bna" in candidate or "nashville" in candidate)
+            ):
+                urls[urljoin(BEEBEE_BASE_URL, href)] = None
+
+    return list(urls.keys())
+
+
+def scrape_jobs() -> dict[str, dict[str, str]]:
+    jobs: dict[str, dict[str, str]] = {}
+
+    for url in discover_bebee_job_urls():
+        try:
+            page_html = fetch_html(url)
+            job_posting = extract_job_posting(page_html)
+        except requests.RequestException as exc:
+            print(f"Failed to fetch {url}: {exc}")
+            continue
+
+        if not job_posting or not is_bna_uge_job(job_posting, url):
+            continue
+
+        key = get_job_key(job_posting, url)
+        title = compact_text(str(job_posting.get("title") or "Unknown"))
+        jobs[key] = {
+            "title": title,
+            "location": get_location(job_posting),
+            "type": infer_job_type(title, job_posting.get("employmentType")),
+            "url": compact_text(str(job_posting.get("url") or url)),
+            "posted": compact_text(str(job_posting.get("datePosted") or "")),
+            "valid_through": compact_text(str(job_posting.get("validThrough") or "")),
+        }
 
     return jobs
 
 
-def check_jobs(current: dict[str, dict]):
-    global seen_jobs
+def format_job(job: dict[str, str]) -> str:
+    title = job.get("title", "Unknown")
+    location = job.get("location", "")
+    job_type = job.get("type", "")
+    url = job.get("url", "")
+    posted = job.get("posted", "")
+    tag = " - Alaska" if "alaska" in title.lower() else ""
 
-    new_jobs = {k: v for k, v in current.items() if k not in seen_jobs}
-    removed_jobs = {k: v for k, v in seen_jobs.items() if k not in current}
-    is_first_run = not seen_jobs
+    parts = [f"**{title}**{tag}"]
+    if location:
+        parts.append(f"Location: {location}")
+    if job_type:
+        parts.append(f"Type: {job_type}")
+    if posted:
+        parts.append(f"Posted: {posted}")
+    if url:
+        parts.append(f"Apply: {url}")
+    return " | ".join(parts)
 
-    if not current:
-        if is_first_run or removed_jobs:
-            send(f"<@&{ROLE_ID}>\n⚠️ No BNA jobs found. Site may have changed structure or blocked scraper.")
-        seen_jobs = current
+
+def send_chunks(parts: list[str]) -> None:
+    message = f"<@&{ROLE_ID}>\n\n" + "\n\n".join(parts)
+    if len(message) <= 1900:
+        send(message)
         return
 
-    parts = []
+    current_chunk = f"<@&{ROLE_ID}>\n\n"
+    for part in parts:
+        if len(current_chunk) + len(part) + 2 > 1900:
+            send(current_chunk.strip())
+            time.sleep(1)
+            current_chunk = f"<@&{ROLE_ID}>\n\n{part}\n\n"
+        else:
+            current_chunk += part + "\n\n"
 
-    lines = "\n".join(format_job(v) for v in current.values())
-    parts.append(f"📋 **CURRENT BNA JOBS ({len(current)}):**\n{lines}")
+    if current_chunk.strip():
+        send(current_chunk.strip())
+
+
+def maybe_send_failure_alert(message: str) -> None:
+    global last_failure_alert_at
+
+    now = time.time()
+    if now - last_failure_alert_at < FAILURE_ALERT_INTERVAL:
+        return
+
+    send(f"<@&{ROLE_ID}>\nWarning: {message}")
+    last_failure_alert_at = now
+
+
+def check_jobs(current: dict[str, dict[str, str]]) -> None:
+    global seen_jobs
+
+    if not current:
+        print("No jobs found; keeping previous state unchanged.")
+        maybe_send_failure_alert(
+            "No BNA jobs found from BeBee mirror. Keeping previous state to avoid false removals/spam."
+        )
+        return
+
+    is_first_run = seen_jobs is None
+    previous = seen_jobs or {}
+    new_jobs = {key: value for key, value in current.items() if key not in previous}
+    removed_jobs = {key: value for key, value in previous.items() if key not in current}
+
+    parts: list[str] = []
+
+    lines = "\n".join(format_job(job) for job in current.values())
+    parts.append(f"CURRENT BNA JOBS ({len(current)}):\n{lines}")
 
     if new_jobs:
-        lines = "\n".join(format_job(v) for v in new_jobs.values())
-        parts.append(f"✈️ **NEW ({len(new_jobs)}):**\n{lines}")
+        lines = "\n".join(format_job(job) for job in new_jobs.values())
+        parts.append(f"NEW ({len(new_jobs)}):\n{lines}")
 
     if removed_jobs:
-        lines = "\n".join(format_job(v) for v in removed_jobs.values())
-        parts.append(f"❌ **REMOVED ({len(removed_jobs)}):**\n{lines}")
+        lines = "\n".join(format_job(job) for job in removed_jobs.values())
+        parts.append(f"REMOVED ({len(removed_jobs)}):\n{lines}")
 
-    if new_jobs or removed_jobs or is_first_run:
-        message = f"<@&{ROLE_ID}>\n\n" + "\n\n".join(parts)
-        if len(message) > 1900:
-            chunks = []
-            current_chunk = f"<@&{ROLE_ID}>\n\n"
-            for part in parts:
-                if len(current_chunk) + len(part) + 2 > 1900:
-                    chunks.append(current_chunk.strip())
-                    current_chunk = part + "\n\n"
-                else:
-                    current_chunk += part + "\n\n"
-            if current_chunk.strip():
-                chunks.append(current_chunk.strip())
-            for chunk in chunks:
-                send(chunk)
-                time.sleep(1)
-        else:
-            send(message)
+    if is_first_run or new_jobs or removed_jobs:
+        send_chunks(parts)
 
     seen_jobs = current
 
 
-async def main():
+def main() -> None:
     print("UGE Job Tracker starting...")
-    first = True
+
     while True:
         try:
             print("Checking jobs...")
-            current = await scrape_jobs()
+            current = scrape_jobs()
             print(f"Found {len(current)} BNA jobs")
             check_jobs(current)
-        except Exception as e:
-            print(f"Error: {e}")
-            if first:
-                send(f"<@&{ROLE_ID}>\n⚠️ Tracker error on startup: {e}")
-        first = False
-        await asyncio.sleep(CHECK_INTERVAL)
+        except Exception as exc:
+            print(f"Error: {exc}")
+            maybe_send_failure_alert(f"Tracker error: {exc}")
+
+        time.sleep(CHECK_INTERVAL)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
