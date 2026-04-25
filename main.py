@@ -42,7 +42,14 @@ last_failure_alert_at = 0.0
 
 def send(content: str) -> bool:
     try:
-        response = requests.post(WEBHOOK_URL, json={"content": content}, timeout=10)
+        response = requests.post(
+            WEBHOOK_URL,
+            json={
+                "content": content,
+                "allowed_mentions": {"roles": [ROLE_ID]},
+            },
+            timeout=10,
+        )
         response.raise_for_status()
     except requests.RequestException as exc:
         print(f"Discord send failed: {exc}")
