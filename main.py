@@ -45,40 +45,42 @@ async def scrape_jobs() -> dict[str, dict]:
         )
         page = await context.new_page()
 
-        # Intercept API responses to get clean JSON job data
+        # Intercept all JSON responses and detect job listing payloads
         async def handle_response(response):
-            url = response.url
-            if "job-postings" in url or "jobRequisitions" in url or "positions" in url:
-                try:
-                    data = await response.json()
-                    if isinstance(data, dict):
-                        items = (
-                            data.get("value")
-                            or data.get("items")
-                            or data.get("jobs")
-                            or data.get("jobRequisitions")
-                            or []
-                        )
-                        api_data.extend(items)
-                    elif isinstance(data, list):
-                        api_data.extend(data)
-                except Exception:
-                    pass
+            ct = response.headers.get("content-type", "")
+            if "json" not in ct:
+                return
+            try:
+                data = await response.json()
+                candidates: list = []
+                if isinstance(data, list):
+                    candidates = data
+                elif isinstance(data, dict):
+                    for key in ["value", "items", "jobs", "jobRequisitions", "data", "results", "listings", "requisitions"]:
+                        v = data.get(key)
+                        if isinstance(v, list) and v:
+                            candidates = v
+                            break
+                if candidates and isinstance(candidates[0], dict):
+                    job_keys = {"jobTitle", "title", "positionTitle", "jobRequisitionID", "requisitionId", "id", "name"}
+                    if job_keys & set(candidates[0].keys()):
+                        api_data.extend(candidates)
+            except Exception:
+                pass
 
         page.on("response", handle_response)
 
         await page.goto(JOB_URL, wait_until="networkidle", timeout=60000)
 
-        # Wait for job cards to appear
+        # cx-job-listing-item is an Angular custom element tag (not a CSS class)
         try:
             await page.wait_for_selector(
-                "[class*='job'], [data-job], .cx-job, .job-card, [class*='position']",
+                "cx-job-listing-item, [class*='job-listing'], [class*='job-card']",
                 timeout=20000,
             )
         except Exception:
             pass
 
-        # If we caught API data, use it
         if api_data:
             for item in api_data:
                 title = (
@@ -111,27 +113,22 @@ async def scrape_jobs() -> dict[str, dict]:
                         "url": job_url,
                     }
         else:
-            # Fallback: parse rendered DOM
-            cards = await page.query_selector_all(
-                "[class*='job-card'], [class*='job-item'], [class*='position-card'], .cx-job-listing-item"
-            )
+            # DOM fallback — use tag selector (Angular custom element, not CSS class)
+            cards = await page.query_selector_all("cx-job-listing-item")
+            if not cards:
+                cards = await page.query_selector_all("[class*='job-card'], [class*='job-item'], [class*='position-card']")
             for card in cards:
+                a = await card.query_selector("a")
+                title = (await a.inner_text()).strip() if a else ""
+                if not title:
+                    continue
+                href = (await a.get_attribute("href") or "") if a else ""
                 text = (await card.inner_text()).strip()
                 lines = [l.strip() for l in text.splitlines() if l.strip()]
-                if not lines:
-                    continue
-                title = lines[0]
-                location = next((l for l in lines if "Nashville" in l or "BNA" in l), "")
+                location = next((l for l in lines if "Nashville" in l or "Tennessee" in l or "BNA" in l), "")
                 if not location:
                     continue
-                job_type = next(
-                    (l for l in lines if any(w in l.lower() for w in ["full", "part", "time"])), ""
-                )
-                href = await card.get_attribute("href") or ""
-                if not href:
-                    a = await card.query_selector("a")
-                    if a:
-                        href = await a.get_attribute("href") or ""
+                job_type = "Part-Time" if "part-time" in title.lower() else "Full-Time" if "full-time" in title.lower() else ""
                 if href and not href.startswith("http"):
                     href = "https://myjobs.adp.com" + href
                 job_id = title + "|" + location
