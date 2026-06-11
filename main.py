@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Any
 
 import requests
-from bs4 import BeautifulSoup
 
 WEBHOOK_URL = os.environ["WEBHOOK_URL"]
 ROLE_ID = os.environ["ROLE_ID"]
@@ -22,10 +21,30 @@ RUN_ONCE = os.getenv("RUN_ONCE", "").lower() in {"1", "true", "yes"}
 DRY_RUN = os.getenv("DRY_RUN", "").lower() in {"1", "true", "yes"}
 LOCATION_FILTER = os.getenv("LOCATION_FILTER", "bna,nashville").lower()
 
-ADP_BASE = "https://myjobs.adp.com/unitedgroundexpressexternal/cx"
-ADP_API = f"{ADP_BASE}/api/jobs"
-ADP_JOB_URL = f"{ADP_BASE}/job/{{job_id}}/details"
-ADP_LISTING_URL = f"{ADP_BASE}/job-listing"
+# ADP CX career-site API (discovered 2026-06-11 by sniffing the SPA's XHR traffic):
+# 1. The public career-site config endpoint returns a short-lived `myJobsToken`
+#    with no cookies or auth required.
+# 2. job-requisitions/apply-custom-filters on my.adp.com accepts that token as a
+#    header (plus rolecode=manager, which is what the SPA itself sends) and
+#    returns every published requisition for the tenant as JSON.
+ADP_TENANT = os.getenv("ADP_TENANT", "unitedgroundexpressexternal")
+ADP_CONFIG_URL = f"https://myjobs.adp.com/public/staffing/v1/career-site/{ADP_TENANT}"
+ADP_SEARCH_URL = (
+    "https://my.adp.com/myadp_prefix/mycareer/public/staffing/v1"
+    "/job-requisitions/apply-custom-filters"
+)
+ADP_SEARCH_PARAMS = {
+    "$select": (
+        "reqId,jobTitle,publishedJobTitle,type,clientRequisitionID,"
+        "postingDate,requisitionLocations"
+    ),
+    "$top": "200",
+    "$filter": "",
+    "tz": "America/Chicago",
+}
+ADP_JOB_URL = (
+    f"https://myjobs.adp.com/{ADP_TENANT}/cx/job-listing?keyword={{req_number}}"
+)
 
 HTTP_HEADERS = {
     "User-Agent": (
@@ -33,9 +52,8 @@ HTTP_HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "application/json, text/html, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": ADP_LISTING_URL,
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US",
 }
 
 state: dict[str, Any] = {}
@@ -83,7 +101,7 @@ def fetch_with_retry(url: str, **kwargs: Any) -> requests.Response:
 
     for attempt in range(1, FETCH_RETRIES + 1):
         try:
-            response = requests.get(url, headers=HTTP_HEADERS, timeout=25, **kwargs)
+            response = requests.get(url, timeout=25, **kwargs)
             response.raise_for_status()
             return response
         except requests.RequestException as exc:
@@ -108,59 +126,59 @@ def parse_date(value: str | None) -> date | None:
         return None
 
 
-def normalize_employment_type(value: Any) -> str:
-    if isinstance(value, list):
-        value = value[0] if value else ""
-    raw = compact(str(value or "")).replace("_", " ").title()
-    if raw in {"None", "Contractor", ""}:
-        return ""
-    return raw
+def fetch_my_jobs_token() -> str:
+    """Grab a fresh anonymous myJobsToken from the public career-site config."""
+    resp = fetch_with_retry(ADP_CONFIG_URL, headers=HTTP_HEADERS)
+    data = resp.json()
+    token = compact(str(data.get("myJobsToken") or ""))
+    if not token:
+        raise requests.RequestException("career-site config had no myJobsToken")
+    return token
 
 
-def infer_job_type(title: str, employment_type: Any) -> str:
+def format_req_location(loc: dict[str, Any]) -> str:
+    address = loc.get("address") or {}
+    city = compact(address.get("cityName") or "")
+    region = compact((address.get("countrySubdivisionLevel1") or {}).get("codeValue") or "")
+    code = compact((loc.get("nameCode") or {}).get("codeValue") or "")
+    parts = [p for p in [city, region] if p]
+    label = ", ".join(parts)
+    if code:
+        label = f"{label} ({code})" if label else code
+    return label
+
+
+def infer_job_type(title: str, raw_type: Any) -> str:
     lower = title.lower()
     if "part-time" in lower or "part time" in lower:
         return "Part-Time"
     if "full-time" in lower or "full time" in lower:
         return "Full-Time"
-    return normalize_employment_type(employment_type)
-
-
-def location_matches_filter(location_str: str) -> bool:
-    if not LOCATION_FILTER:
-        return True
-    haystack = location_str.lower()
-    return any(term.strip() in haystack for term in LOCATION_FILTER.split(","))
-
-
-def format_location(loc: Any) -> str:
-    if isinstance(loc, dict):
-        city = compact(loc.get("city") or loc.get("addressLocality") or "")
-        state = compact(loc.get("state") or loc.get("addressRegion") or "")
-        parts = [p for p in [city, state] if p]
-        return ", ".join(parts)
-    return compact(str(loc or ""))
+    raw = compact(str(raw_type or ""))
+    return "" if raw in {"", "None", "Normal"} else raw
 
 
 def parse_adp_job(raw: dict[str, Any]) -> dict[str, str] | None:
-    job_id = compact(str(raw.get("jobId") or raw.get("requisitionId") or ""))
-    title = compact(str(raw.get("title") or raw.get("jobTitle") or ""))
+    req_id = compact(str(raw.get("reqId") or ""))
+    title = compact(str(raw.get("publishedJobTitle") or raw.get("jobTitle") or ""))
 
-    if not job_id or not title:
+    if not req_id or not title:
         return None
 
-    location_str = format_location(raw.get("location") or raw.get("jobLocation") or {})
+    locations = raw.get("requisitionLocations") or []
+    location_str = "; ".join(
+        filter(None, (format_req_location(loc) for loc in locations))
+    )
 
-    if not location_matches_filter(location_str):
-        return None
+    if LOCATION_FILTER:
+        haystack = f"{title} {location_str}".lower()
+        if not any(term.strip() in haystack for term in LOCATION_FILTER.split(",")):
+            return None
 
-    url = compact(str(raw.get("applyUrl") or raw.get("url") or ""))
-    if not url:
-        url = ADP_JOB_URL.format(job_id=job_id)
-
-    posted = compact(str(raw.get("datePosted") or raw.get("postedDate") or ""))
+    req_number = compact(str(raw.get("clientRequisitionID") or ""))
+    posted = compact(str(raw.get("postingDate") or ""))
     valid_through = compact(
-        str(raw.get("validThrough") or raw.get("closingDate") or raw.get("expirationDate") or "")
+        str(raw.get("validThrough") or raw.get("applicationsAcceptedThroughDate") or "")
     )
 
     vt_date = parse_date(valid_through)
@@ -170,93 +188,43 @@ def parse_adp_job(raw: dict[str, Any]) -> dict[str, str] | None:
     return {
         "title": title,
         "location": location_str,
-        "type": infer_job_type(title, raw.get("employmentType")),
-        "url": url,
+        "type": infer_job_type(title, raw.get("type")),
+        "req_number": req_number,
+        "url": ADP_JOB_URL.format(req_number=req_number or req_id),
         "posted": posted[:10] if posted else "",
         "valid_through": valid_through[:10] if valid_through else "",
     }
 
 
-def fetch_via_api() -> list[dict[str, Any]] | None:
-    """Hit ADP's JSON API endpoint directly."""
-    params = {"offset": 0, "limit": 200, "lang": "en_US"}
-    try:
-        resp = fetch_with_retry(ADP_API, params=params)
-        data = resp.json()
-    except (requests.RequestException, json.JSONDecodeError) as exc:
-        log(f"ADP API call failed: {exc}")
-        return None
-
-    # ADP returns {"totalCount": N, "jobs": [...]} or {"jobPostings": [...]}
-    if isinstance(data, list):
-        return data
-    for key in ("jobs", "jobPostings", "results", "data"):
-        if key in data and isinstance(data[key], list):
-            return data[key]
-
-    log(f"Unexpected ADP API shape: {list(data.keys()) if isinstance(data, dict) else type(data)}")
-    return None
-
-
-def fetch_via_html() -> list[dict[str, Any]] | None:
-    """Fallback: parse JSON-LD or embedded __NEXT_DATA__ from the listing page HTML."""
-    try:
-        resp = fetch_with_retry(ADP_LISTING_URL)
-        html = resp.text
-    except requests.RequestException as exc:
-        log(f"ADP HTML fetch failed: {exc}")
-        return None
-
-    soup = BeautifulSoup(html, "html.parser")
-    jobs: list[dict[str, Any]] = []
-
-    # Try __NEXT_DATA__ / window.__data__ embedded JSON blobs
-    for script in soup.find_all("script"):
-        text = script.string or script.get_text()
-        if not text:
-            continue
-
-        for prefix in ("window.__data__=", "window.__INITIAL_STATE__=", "__NEXT_DATA__"):
-            if prefix in text:
-                try:
-                    raw_json = text.split(prefix, 1)[1].strip().lstrip("=").rstrip(";")
-                    blob = json.loads(raw_json)
-                    for key in ("jobs", "jobPostings", "results"):
-                        if isinstance(blob, dict) and key in blob:
-                            jobs.extend(blob[key])
-                except (json.JSONDecodeError, IndexError):
-                    pass
-
-        # JSON-LD JobPosting blocks
-        if script.get("type") == "application/ld+json":
-            try:
-                blob = json.loads(text)
-                if isinstance(blob, dict) and blob.get("@type") == "JobPosting":
-                    jobs.append(blob)
-                elif isinstance(blob, list):
-                    jobs.extend(b for b in blob if isinstance(b, dict) and b.get("@type") == "JobPosting")
-            except json.JSONDecodeError:
-                pass
-
-    return jobs if jobs else None
-
-
 def scrape_jobs() -> dict[str, dict[str, str]]:
-    raw_jobs = fetch_via_api()
+    token = fetch_my_jobs_token()
+    headers = {**HTTP_HEADERS, "rolecode": "manager", "myJobsToken": token}
 
-    if not raw_jobs:
-        log("API returned nothing; trying HTML fallback...")
-        raw_jobs = fetch_via_html()
+    raw_jobs: list[dict[str, Any]] = []
+    offset = 0
+    while True:
+        params = {**ADP_SEARCH_PARAMS, "$skip": str(offset)}
+        resp = fetch_with_retry(ADP_SEARCH_URL, headers=headers, params=params)
+        try:
+            data = resp.json()
+        except json.JSONDecodeError as exc:
+            raise requests.RequestException(f"ADP search returned non-JSON: {exc}")
 
-    if not raw_jobs:
-        return {}
+        page = data.get("jobRequisitions") or []
+        raw_jobs.extend(page)
+        total = int(data.get("count") or len(raw_jobs))
+        offset += len(page)
+        if not page or offset >= total:
+            break
+
+    log(f"ADP returned {len(raw_jobs)} total requisitions for {ADP_TENANT}")
 
     jobs: dict[str, dict[str, str]] = {}
     for raw in raw_jobs:
         parsed = parse_adp_job(raw)
         if parsed is None:
             continue
-        key = compact(str(raw.get("jobId") or raw.get("requisitionId") or parsed["url"]))
+        key = compact(str(raw.get("reqId") or parsed["req_number"] or parsed["url"]))
         jobs[key] = parsed
 
     return jobs
@@ -266,11 +234,14 @@ def format_job(job: dict[str, str]) -> str:
     title = job.get("title", "Unknown")
     location = job.get("location", "")
     job_type = job.get("type", "")
+    req_number = job.get("req_number", "")
     url = job.get("url", "")
     posted = job.get("posted", "")
     valid_through = job.get("valid_through", "")
 
     parts = [f"**{title}**"]
+    if req_number:
+        parts.append(f"Req: {req_number}")
     if location:
         parts.append(f"Location: {location}")
     if job_type:
@@ -448,7 +419,8 @@ def main() -> None:
     state = load_state()
     log(
         "UGE Job Tracker starting "
-        f"(source=ADP, interval={CHECK_INTERVAL}s, removal_confirmations={REMOVAL_CONFIRMATIONS}, "
+        f"(source=ADP CX API, tenant={ADP_TENANT}, interval={CHECK_INTERVAL}s, "
+        f"removal_confirmations={REMOVAL_CONFIRMATIONS}, "
         f"closing_soon_days={CLOSING_SOON_DAYS}, location_filter={LOCATION_FILTER!r}, "
         f"state_file={STATE_FILE})"
     )
